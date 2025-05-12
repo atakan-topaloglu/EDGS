@@ -13,7 +13,7 @@
   <a href="https://compvis.github.io/EDGS/"><img src="https://img.shields.io/badge/Project-Page-blue" alt="Project Page"></a>
   <a href="https://arxiv.org/pdf/??????"><img src="https://img.shields.io/badge/arXiv-PDF-b31b1b" alt="Paper"></a>
   <a href="https://colab.research.google.com/github/CompVis/EDGS/blob/main/notebooks/fit_model_to_scene_full.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
-  <a href="https://huggingface.co/spaces/magistrkoljan/EDGS"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue" alt="Hugging Face"></a>
+  <a href="https://huggingface.co/spaces/CompVis/EDGS"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue" alt="Hugging Face"></a>
 </p>
 
 <p align="center">
