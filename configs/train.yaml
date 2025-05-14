@@ -6,7 +6,7 @@ seed: 228
 
 wandb:
   mode: "online" # "disabled" for no logging
-  entity: "3dcorrespondence"
+  entity: "atopaloglu21"
   project: "Adv3DGS"
   group: null
   name: null
