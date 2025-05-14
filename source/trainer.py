@@ -123,43 +123,26 @@ class EDGSTrainer:
 
     def init_with_corr(self, cfg_init_wC, cfg_init_direct_pcd, verbose=False, roma_model=None):
         visualization_dict = None
-        # SfM points are loaded by Scene() if points3D.bin exists, before this method is called.
         initial_sfm_points_count = self.GS.gaussians.get_xyz.shape[0] 
         if initial_sfm_points_count > 0:
              self.CONSOLE.print(f"{initial_sfm_points_count} SfM points were loaded by the Scene object.", style="info")
         else:
              self.CONSOLE.print("No SfM points were loaded by the Scene object.", style="info")
 
-
         if cfg_init_direct_pcd.use and cfg_init_direct_pcd.path is not None:
             self.CONSOLE.print(f"Prioritizing direct PCD initialization from: {cfg_init_direct_pcd.path}", style="info")
-            
-            # Remove pre-existing (SfM) points before loading from PCD.
-            # `create_from_pcd` replaces existing points, so an explicit prune before might be redundant
-            # but ensures a clean state if `create_from_pcd` behavior changes or if it expects an empty model.
-            # For clarity and safety, we ensure the model is "clean" of SfM points if they are not desired.
-            if initial_sfm_points_count > 0:
-                self.CONSOLE.print(f"Removing {initial_sfm_points_count} pre-existing SfM points before direct PCD loading.", style="info")
-                # Create a dummy mask to effectively clear all points, then re-init optimizer
-                # Note: create_from_pcd already re-initializes optimizer parameters.
-                # So, just ensuring the GaussianModel is empty or that create_from_pcd fully overwrites is key.
-                # Let's assume create_from_pcd correctly replaces everything.
-                # No explicit prune needed here if create_from_pcd is a full reset.
-                # self.GS.gaussians._xyz = torch.empty(0,3).cuda() # Example of clearing, but create_from_pcd should handle it
-                pass # create_from_pcd will overwrite.
-
             visualization_dict = self.init_gaussians_from_pcd(cfg_init_direct_pcd.path, cfg_init_direct_pcd.spatial_lr_scale)
             initial_sfm_points_count = 0 # SfM points are now replaced by PCD points
         
         elif cfg_init_wC.use: # EDGS RoMA initialization
             self.CONSOLE.print("Using EDGS (RoMA) correspondence-based initialization.", style="info")
             
-            if cfg_init_wC.nns_per_ref == 1: # This logic is from original EDGS
+            if cfg_init_wC.nns_per_ref == 1:
                 init_fn = init_gaussians_with_corr_fast
             else:
                 init_fn = init_gaussians_with_corr
             
-            # RoMA init function adds points to existing ones (SfM points if any)
+            # This function MODIFIES self.GS.gaussians IN-PLACE by adding new points
             _, _, visualization_dict = init_fn(
                 self.GS.gaussians,
                 self.scene,
@@ -168,35 +151,48 @@ class EDGSTrainer:
                 verbose=verbose,
                 roma_model=roma_model)
 
-            # Remove SfM points if add_SfM_init is False and SfM points were initially present
+            # After init_fn, self.GS.gaussians._xyz etc. now include both SfM and RoMA points.
+            
             if not cfg_init_wC.add_SfM_init and initial_sfm_points_count > 0:
                 current_total_points = self.GS.gaussians.get_xyz.shape[0]
                 # Check if RoMA actually added points, otherwise SfM points might be all there is
                 if current_total_points > initial_sfm_points_count:
-                    # Create a mask to remove the first `initial_sfm_points_count` points (these were the SfM points)
-                    mask_remove_sfm = torch.zeros(current_total_points, dtype=torch.bool).to(self.device)
-                    mask_remove_sfm[:initial_sfm_points_count] = True
                     
-                    self.CONSOLE.print(f"EDGS RoMA: Removing {initial_sfm_points_count} SfM points as per add_SfM_init=False.", style="info")
+                    # CRITICAL FIX: Ensure tmp_radii is correctly sized BEFORE pruning.
+                    # This line matches the original EDGS logic which worked.
+                    # It explicitly resizes tmp_radii to match the current total number of points (_xyz)
+                    # and initializes them to zero. This ensures consistency for the subsequent prune.
+                    if self.GS.gaussians.tmp_radii is None or self.GS.gaussians.tmp_radii.shape[0] != current_total_points:
+                        self.CONSOLE.print(f"RoMA init: Aligning tmp_radii (size {self.GS.gaussians.tmp_radii.shape[0] if self.GS.gaussians.tmp_radii is not None else 'None'}) to current total points ({current_total_points}) before SfM pruning.", style="info")
+                        self.GS.gaussians.tmp_radii = torch.zeros(current_total_points, device=self.device)
+                    
+                    mask_remove_sfm = torch.zeros(current_total_points, dtype=torch.bool).to(self.device)
+                    mask_remove_sfm[:initial_sfm_points_count] = True # Mark first initial_sfm_points_count points for removal
+                    
+                    self.CONSOLE.print(f"EDGS RoMA: Removing {initial_sfm_points_count} SfM points as per add_SfM_init=False. "
+                                       f"Total points before prune: {current_total_points}, "
+                                       f"tmp_radii size: {self.GS.gaussians.tmp_radii.shape[0]}", style="info")
+                    
                     self.GS.gaussians.prune_points(mask_remove_sfm)
                     torch.cuda.empty_cache()
         
-        else: # Neither direct PCD nor RoMA initialization is used.
+        else: 
             if initial_sfm_points_count > 0:
-                self.CONSOLE.print(f"Using {initial_sfm_points_count} SfM points as primary initialization.", style="info")
+                self.CONSOLE.print(f"Using {initial_sfm_points_count} SfM points as primary initialization (no RoMA or direct PCD).", style="info")
+                # Ensure tmp_radii is initialized for SfM points if they are the only source
+                if self.GS.gaussians.tmp_radii is None or self.GS.gaussians.tmp_radii.shape[0] != initial_sfm_points_count:
+                    self.CONSOLE.print(f"Initializing tmp_radii for {initial_sfm_points_count} SfM points.", style="info")
+                    self.GS.gaussians.tmp_radii = torch.zeros(initial_sfm_points_count, device=self.device)
             else:
                 self.CONSOLE.print("No SfM points found and no other initialization specified. Starting with 0 Gaussians.", style="warning")
-                # Consider raising an error or strong warning if train.no_densify is also True,
-                # as training might not proceed meaningfully.
 
         # Common post-processing for scaling, similar to EDGS post-init
-        # Apply if EDGS RoMA added new points or if Direct PCD was used.
-        # This ensures the initial scales are small, promoting refinement.
+        # (This part seems okay from your previous code version)
         points_were_added_or_replaced_by_edgs_or_pcd = False
         if cfg_init_direct_pcd.use and cfg_init_direct_pcd.path is not None:
             points_were_added_or_replaced_by_edgs_or_pcd = True
-        elif cfg_init_wC.use and self.GS.gaussians.get_xyz.shape[0] > initial_sfm_points_count:
-             # RoMA was used and it added points beyond any initial SfM points
+        # Check if RoMA was used AND it actually added points (or SfM points were removed and RoMA points remain)
+        elif cfg_init_wC.use and (self.GS.gaussians.get_xyz.shape[0] != initial_sfm_points_count or (not cfg_init_wC.add_SfM_init and initial_sfm_points_count > 0)):
             points_were_added_or_replaced_by_edgs_or_pcd = True
         
         if points_were_added_or_replaced_by_edgs_or_pcd:
@@ -204,13 +200,14 @@ class EDGSTrainer:
                 gaussians = self.GS.gaussians
                 if gaussians.get_xyz.shape[0] > 0:
                     self.CONSOLE.print("Applying 0.5x scaling adjustment to initialized Gaussians.", style="info")
-                    current_param_scales = gaussians._scaling.detach().clone() # These are in logit/log space
-                    activated_scales = gaussians.scaling_activation(current_param_scales) # Convert to linear scale
-                    adjusted_linear_scales = activated_scales * 0.5 # Reduce linear scale
-                    new_parameter_scales = gaussians.scaling_inverse_activation(adjusted_linear_scales) # Convert back to logit/log space
-                    gaussians._scaling.data.copy_(new_parameter_scales) # Update parameter in-place
+                    # Using scaling_activation and scaling_inverse_activation is safer
+                    # as _scaling stores parameters, not direct scale values.
+                    activated_scales = gaussians.get_scaling # Gets scales in normal space
+                    adjusted_linear_scales = activated_scales * 0.5
+                    gaussians._scaling.data.copy_(gaussians.scaling_inverse_activation(adjusted_linear_scales))
                     
         return visualization_dict
+
 
     def train(self, train_cfg):
         # 3DGS training
@@ -415,20 +412,24 @@ class EDGSTrainer:
             return
             
         self.CONSOLE.print("\n[ITER {}] Saving Gaussians (scene.save)".format(self.gs_step), style="info")
-        self.scene.save(self.gs_step)
+        # scene.save() typically saves the model in its own format (e.g., point_cloud/iteration_X/point_cloud.ply)
+        self.scene.save(self.gs_step) 
         
-        # Save checkpoint using capture method
-        # capture() returns a Pytorch state_dict like structure
-        captured_state = self.GS.gaussians.capture()
-        # Check if captured_state is not None and contains actual parameters
-        if captured_state and captured_state.get('_xyz') is not None and captured_state['_xyz'].shape[0] > 0:
-            self.CONSOLE.print("\n[ITER {}] Saving Checkpoint (capture)".format(self.gs_step), style="info")
-            torch.save((captured_state, self.gs_step),
+        # Save checkpoint using capture method for full training state
+        captured_state_tuple = self.GS.gaussians.capture() # This is a tuple
+
+        # The _xyz tensor is the second element (index 1) in the tuple returned by capture()
+        # Check if the tuple is not None, has enough elements, _xyz is not None, and has points
+        if captured_state_tuple and \
+           len(captured_state_tuple) > 1 and \
+           captured_state_tuple[1] is not None and \
+           captured_state_tuple[1].shape[0] > 0:
+            
+            self.CONSOLE.print("\n[ITER {}] Saving Checkpoint (capture method)".format(self.gs_step), style="info")
+            torch.save((captured_state_tuple, self.gs_step), # Save the tuple directly
                     self.scene.model_path + "/chkpnt" + str(self.gs_step) + ".pth")
         else:
-            self.CONSOLE.print("\n[ITER {}] Capture method returned empty state. Skipping checkpoint saving.".format(self.gs_step), style="warning")
-
-
+            self.CONSOLE.print("\n[ITER {}] Capture method returned empty or invalid state. Skipping checkpoint saving.".format(self.gs_step), style="warning")
     def prune(self, radii, min_opacity=0.005):
         if self.GS.gaussians.get_xyz.shape[0] == 0: # No points to prune
             return
