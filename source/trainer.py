@@ -430,6 +430,7 @@ class EDGSTrainer:
                     self.scene.model_path + "/chkpnt" + str(self.gs_step) + ".pth")
         else:
             self.CONSOLE.print("\n[ITER {}] Capture method returned empty or invalid state. Skipping checkpoint saving.".format(self.gs_step), style="warning")
+    
     def prune(self, radii, min_opacity=0.005):
         if self.GS.gaussians.get_xyz.shape[0] == 0: # No points to prune
             return

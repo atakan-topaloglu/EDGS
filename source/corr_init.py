@@ -114,30 +114,33 @@ def compute_warp_and_confidence(viewpoint_cam1, viewpoint_cam2, roma_model, devi
         imB: Processed image B as numpy array.
     """
     # Prepare images
-    imA = viewpoint_cam1.original_image.detach().cpu().numpy().transpose(1, 2, 0)
-    imB = viewpoint_cam2.original_image.detach().cpu().numpy().transpose(1, 2, 0)
-    imA = Image.fromarray(np.clip(imA * 255, 0, 255).astype(np.uint8))
-    imB = Image.fromarray(np.clip(imB * 255, 0, 255).astype(np.uint8))
+    imA_np_orig = viewpoint_cam1.original_image.detach().cpu().numpy().transpose(1, 2, 0)
+    imB_np_orig = viewpoint_cam2.original_image.detach().cpu().numpy().transpose(1, 2, 0)
+    imA_pil = Image.fromarray(np.clip(imA_np_orig * 255, 0, 255).astype(np.uint8))
+    imB_pil = Image.fromarray(np.clip(imB_np_orig * 255, 0, 255).astype(np.uint8))
 
     if verbose:
-        fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(16, 8))
-        cax1 = ax[0].imshow(imA)
-        ax[0].set_title("Image 1")
-        cax2 = ax[1].imshow(imB)
-        ax[1].set_title("Image 2")
-        fig.colorbar(cax1, ax=ax[0])
-        fig.colorbar(cax2, ax=ax[1])
+        fig_pair, ax_pair = plt.subplots(nrows=1, ncols=2, figsize=(16, 8))
+        # Display original images which should be in [0,1] range before * 255 or already uint8
+        # If viewpoint_cam.original_image is float [0,1], imshow handles it.
+        # If it has been converted to uint8 [0,255] for PIL, that's also fine.
+        ax_pair[0].imshow(np.clip(imA_np_orig,0,1) if imA_np_orig.max() <=1.0 else imA_pil) # Be robust to raw tensor or PIL
+        ax_pair[0].set_title("Image 1")
+        ax_pair[1].imshow(np.clip(imB_np_orig,0,1) if imB_np_orig.max() <=1.0 else imB_pil)
+        ax_pair[1].set_title("Image 2")
+        # Colorbars for images are usually not needed unless they are single channel
+        # fig_pair.colorbar(cax1, ax=ax_pair[0]) 
+        # fig_pair.colorbar(cax2, ax=ax_pair[1])
     
-        for axis in ax:
-            axis.axis('off')
-        # Save the figure into the dictionary
-        output_dict[f'image_pair'] = fig
-   
-    # Transform images
+        for axis_single in ax_pair: # Renamed to avoid conflict
+            axis_single.axis('off')
+        output_dict['image_pair_display'] = fig_pair # Use a more specific key
+        plt.close(fig_pair)
+          
     ws, hs = roma_model.w_resized, roma_model.h_resized
-    test_transform = get_tuple_transform_ops(resize=(hs, ws), normalize=True)
-    im_A, im_B = test_transform((imA, imB))
-    batch = {"im_A": im_A[None].to(device), "im_B": im_B[None].to(device)}
+    test_transform = get_tuple_transform_ops(resize=(hs, ws), normalize=True) # Normalizes to [-1,1] for RoMa
+    im_A_transformed, im_B_transformed = test_transform((imA_pil, imB_pil)) # Pass PIL images
+    batch = {"im_A": im_A_transformed[None].to(device), "im_B": im_B_transformed[None].to(device)}
 
     # Forward pass through Roma model
     corresps = roma_model.forward(batch) if not roma_model.symmetric else roma_model.forward_symmetric(batch)
@@ -172,8 +175,9 @@ def compute_warp_and_confidence(viewpoint_cam1, viewpoint_cam2, roma_model, devi
 
     warp = torch.cat((im_A_coords, im_A_to_im_B), dim=-1)
     certainty = certainty.sigmoid()
+    imB_output_uint8 = np.clip(imB_np_orig * 255, 0, 255).astype(np.uint8)
 
-    return certainty[0, 0], warp[0], np.array(imB)
+    return certainty[0, 0], warp[0], imB_output_uint8
 
 
 def resize_batch(tensors_3d, tensors_4d, target_shape):
@@ -224,64 +228,98 @@ def aggregate_confidences_and_warps(viewpoint_stack, closest_indices, roma_model
     """
     certainties_all, warps_all, imB_compound = [], [], []
 
-    for nn in tqdm(closest_indices[source_idx]):
+    for nn_idx_in_list, nn_cam_idx in enumerate(tqdm(closest_indices[source_idx], desc="Aggregating NNs", leave=False)): # Added desc and leave
 
         viewpoint_cam1 = viewpoint_stack[source_idx]
-        viewpoint_cam2 = viewpoint_stack[nn]
+        viewpoint_cam2 = viewpoint_stack[nn_cam_idx] # Use nn_cam_idx from closest_indices
 
-        certainty, warp, imB = compute_warp_and_confidence(viewpoint_cam1, viewpoint_cam2, roma_model, verbose=verbose, output_dict=output_dict)
+        # Pass a unique key for output_dict if multiple NNs are processed
+        current_output_dict_key_prefix = f"nn_{nn_idx_in_list}_pair"
+
+        certainty, warp, imB = compute_warp_and_confidence(
+            viewpoint_cam1, viewpoint_cam2, roma_model, 
+            verbose=verbose, 
+            # Pass a sub-dictionary or prefixed keys to avoid overwriting in output_dict
+            output_dict=output_dict if not verbose else {k: v for k, v in output_dict.items() if not k.startswith(current_output_dict_key_prefix)} 
+                                     # A more robust way would be to pass a prefix to compute_warp_and_confidence
+        )
         certainties_all.append(certainty)
         warps_all.append(warp)
         imB_compound.append(imB)
 
-    certainties_all = torch.stack(certainties_all, dim=0)
+    certainties_all_stacked = torch.stack(certainties_all, dim=0) # Renamed for clarity
     target_shape = imB_compound[0].shape[:2]
+    
     if verbose: 
-        print("certainties_all.shape:", certainties_all.shape)
+        print("certainties_all_stacked.shape:", certainties_all_stacked.shape)
         print("torch.stack(warps_all, dim=0).shape:", torch.stack(warps_all, dim=0).shape)
         print("target_shape:", target_shape)        
 
-    certainties_all_resized, warps_all_resized = resize_batch(certainties_all,
+    certainties_all_resized, warps_all_resized = resize_batch(certainties_all_stacked,
                                                               torch.stack(warps_all, dim=0),
                                                               target_shape
                                                               )
-
     if verbose:
         print("warps_all_resized.shape:", warps_all_resized.shape)
-        for n, cert in enumerate(certainties_all):
-            fig, ax = plt.subplots()
-            cax = ax.imshow(cert.cpu().numpy(), cmap='viridis')
-            fig.colorbar(cax, ax=ax)
-            ax.set_title("Pixel-wise Confidence")
-            output_dict[f'certainty_{n}'] = fig
+        
+        # Visualize certainties (should be fine as they are [0,1] from sigmoid)
+        for n, cert_tensor in enumerate(certainties_all_stacked): # Use original certainties
+            fig_cert, ax_cert = plt.subplots()
+            cax_cert = ax_cert.imshow(cert_tensor.cpu().numpy(), cmap='viridis', vmin=0, vmax=1)
+            fig_cert.colorbar(cax_cert, ax=ax_cert)
+            ax_cert.set_title(f"Certainty Orig {n}")
+            output_dict[f'certainty_orig_{n}'] = fig_cert
+            plt.close(fig_cert) # Close figure
 
-        for n, warp in enumerate(warps_all):
-            fig, ax = plt.subplots()
-            cax = ax.imshow(warp.cpu().numpy()[:, :, :3], cmap='viridis')
-            fig.colorbar(cax, ax=ax)
-            ax.set_title("Pixel-wise warp")
-            output_dict[f'warp_resized_{n}'] = fig
+        for n, cert_tensor_resized in enumerate(certainties_all_resized):
+            fig_cert_res, ax_cert_res = plt.subplots()
+            cax_cert_res = ax_cert_res.imshow(cert_tensor_resized.cpu().numpy(), cmap='viridis', vmin=0, vmax=1)
+            fig_cert_res.colorbar(cax_cert_res, ax=ax_cert_res)
+            ax_cert_res.set_title(f"Certainty Resized {n}")
+            output_dict[f'certainty_resized_{n}'] = fig_cert_res
+            plt.close(fig_cert_res) # Close figure
 
-        for n, cert in enumerate(certainties_all_resized):
-            fig, ax = plt.subplots()
-            cax = ax.imshow(cert.cpu().numpy(), cmap='viridis')
-            fig.colorbar(cax, ax=ax)
-            ax.set_title("Pixel-wise Confidence resized")
-            output_dict[f'certainty_resized_{n}'] = fig
+        # Visualize warps (e.g., first two channels normalized)
+        # For warps_all (original resolution before resize_batch)
+        for n, warp_tensor_orig in enumerate(warps_all):
+            warp_np_orig = warp_tensor_orig.cpu().numpy()
+            fig_warp_orig, axes_warp_orig = plt.subplots(1, 2, figsize=(10,4))
+            ax_titles_orig = [f"Warp Orig {n} Ch0 (norm)", f"Warp Orig {n} Ch1 (norm)"]
+            for i in range(2): # Visualize first two channels (e.g., source x, y)
+                channel_data = warp_np_orig[:, :, i]
+                if channel_data.max() > channel_data.min(): # Avoid division by zero if flat
+                    norm_channel = (channel_data - channel_data.min()) / (channel_data.max() - channel_data.min())
+                else:
+                    norm_channel = np.zeros_like(channel_data)
+                im = axes_warp_orig[i].imshow(norm_channel, cmap='viridis', vmin=0, vmax=1)
+                axes_warp_orig[i].set_title(ax_titles_orig[i])
+                fig_warp_orig.colorbar(im, ax=axes_warp_orig[i])
+            output_dict[f'warp_orig_{n}_ch01_norm'] = fig_warp_orig
+            plt.close(fig_warp_orig)
 
-        for n, warp in enumerate(warps_all_resized):
-            fig, ax = plt.subplots()
-            cax = ax.imshow(warp.cpu().numpy()[:, :, :3], cmap='viridis')
-            fig.colorbar(cax, ax=ax)
-            ax.set_title("Pixel-wise warp resized")
-            output_dict[f'warp_resized_{n}'] = fig
+        # For warps_all_resized
+        for n, warp_tensor_resized in enumerate(warps_all_resized):
+            warp_np_resized = warp_tensor_resized.cpu().numpy()
+            fig_warp_res, axes_warp_res = plt.subplots(1, 2, figsize=(10,4))
+            ax_titles_resized = [f"Warp Resized {n} Ch0 (norm)", f"Warp Resized {n} Ch1 (norm)"]
+            for i in range(2): # Visualize first two channels
+                channel_data_resized = warp_np_resized[:, :, i]
+                if channel_data_resized.max() > channel_data_resized.min():
+                    norm_channel_resized = (channel_data_resized - channel_data_resized.min()) / (channel_data_resized.max() - channel_data_resized.min())
+                else:
+                    norm_channel_resized = np.zeros_like(channel_data_resized)
+                im_resized = axes_warp_res[i].imshow(norm_channel_resized, cmap='viridis', vmin=0, vmax=1)
+                axes_warp_res[i].set_title(ax_titles_resized[i])
+                fig_warp_res.colorbar(im_resized, ax=axes_warp_res[i])
+            output_dict[f'warp_resized_{n}_ch01_norm'] = fig_warp_res
+            plt.close(fig_warp_res)
 
     certainties_max, certainties_max_idcs = torch.max(certainties_all_resized, dim=0)
     H, W = certainties_max.shape
-
     warps_max = warps_all_resized[certainties_max_idcs, torch.arange(H).unsqueeze(1), torch.arange(W)]
 
-    imA = viewpoint_cam1.original_image.detach().cpu().numpy().transpose(1, 2, 0)
+    imA_tensor = viewpoint_stack[source_idx].original_image # Assuming this is the reference viewpoint_cam1
+    imA = imA_tensor.detach().cpu().numpy().transpose(1, 2, 0)
     imA = np.clip(imA * 255, 0, 255).astype(np.uint8)
 
     return certainties_max, warps_max, certainties_max_idcs, imA, imB_compound, certainties_all_resized, warps_all_resized
